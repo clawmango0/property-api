@@ -1,0 +1,4 @@
+
+# Local environment variables (don't commit!)
+.env
+*.env

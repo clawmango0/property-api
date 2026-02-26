@@ -7,7 +7,7 @@ const http = require('http');
 const https = require('https');
 
 // ScraperAPI configuration
-const SCRAPER_API_KEY = '0b281e9035c595a332e175b172d8b36e';
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || '';
 
 function fetchWithScraperAPI(url) {
     return new Promise((resolve, reject) => {
