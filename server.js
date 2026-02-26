@@ -1,92 +1,95 @@
-// Property Scraper API Server with curl_cffi
+// Property Scraper API Server with ScraperAPI
 // Run with: node server.js
 // Endpoint: GET /api/scrape?url=...
+// Uses ScraperAPI to bypass blocks
 
 const http = require('http');
-const { spawn } = require('child_process');
+const https = require('https');
 
-// Use Python with curl_cffi for scraping
-function scrapeProperty(url) {
+// ScraperAPI configuration
+const SCRAPER_API_KEY = '0b281e9035c595a332e175b172d8b36e';
+
+function fetchWithScraperAPI(url) {
     return new Promise((resolve, reject) => {
-        const pythonScript = `
-import sys
-import curl_cffi
-import re
-import json
-
-session = curl_cffi.Session(impersonate="chrome")
-url = sys.argv[1]
-
-try:
-    response = session.get(url)
-    html = response.text
-    
-    data = {"url": url, "found": False}
-    
-    # Address from title
-    title_match = re.search(r'<title>([^<]+)</title>', html)
-    if title_match:
-        data["address"] = title_match.group(1).split(" - ")[0]
-    
-    # Price - find $xxx,xxx patterns
-    prices = re.findall(r'\\$(\\d{1,3}(?:,\\d{3})*)', html)
-    price_vals = [int(p.replace(",", "")) for p in prices if 50000 <= int(p.replace(",", "")) <= 2000000]
-    if price_vals:
-        data["price"] = max(price_vals)
-        data["found"] = True
-    
-    # Beds
-    beds_match = re.search(r'(\\d+)\\s*(?:bed|bedroom)', html, re.I)
-    if beds_match:
-        data["beds"] = beds_match.group(1)
-        data["found"] = True
-    
-    # Baths  
-    baths_match = re.search(r'(\\d+\\.?\\d*)\\s*(?:bath|bathroom)', html, re.I)
-    if baths_match:
-        data["baths"] = baths_match.group(1)
-        data["found"] = True
-    
-    # Sqft
-    sqft_match = re.search(r'([\\d,]+)\\s*(?:sqft|sq\\.ft)', html, re.I)
-    if sqft_match:
-        data["sqft"] = sqft_match.group(1).replace(",", "")
-    
-    # Type
-    type_match = re.search(r'Property Type[:\\s]+([^\\n<]+)', html, re.I)
-    if type_match:
-        data["type"] = type_match.group(1).strip()[:50]
-    
-    print(json.dumps(data))
-except Exception as e:
-    print(json.dumps({"error": str(e)}))
-`;
+        const targetUrl = `https://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true`;
         
-        const python = spawn('python3', ['-c', pythonScript, url], {
-            env: { ...process.env, PYTHONPATH: '/home/claw/.openclaw/venv/lib/python3.14/site-packages' }
-        });
-        
-        let output = '';
-        python.stdout.on('data', (data) => { output += data; });
-        python.stderr.on('data', (data) => { console.error('Python error:', data.toString()); });
-        python.on('close', (code) => {
-            if (code === 0) {
-                try {
-                    resolve(JSON.parse(output));
-                } catch(e) {
-                    reject(new Error('Failed to parse output: ' + output));
+        https.get(targetUrl, (resp) => {
+            let data = '';
+            
+            resp.on('data', (chunk) => {
+                data += chunk;
+            });
+            
+            resp.on('end', () => {
+                if (resp.statusCode === 200) {
+                    resolve(data);
+                } else {
+                    reject(new Error(`ScraperAPI error: ${resp.statusCode}`));
                 }
-            } else {
-                reject(new Error('Python process failed'));
-            }
+            });
+        }).on('error', (err) => {
+            reject(err);
         });
     });
+}
+
+function extractPropertyData(html, url) {
+    const data = {
+        url: url,
+        found: false,
+        error: null
+    };
+    
+    // Use regex to extract property data
+    // Price patterns
+    const priceMatches = html.match(/\$(\d{1,3}(?:,\d{3})+)/g);
+    if (priceMatches) {
+        const prices = priceMatches
+            .map(p => parseInt(p.replace(/[$,]/g, '')))
+            .filter(p => p >= 30000 && p <= 1000000);
+        
+        if (prices.length > 0) {
+            // Usually the listing price is the largest reasonable one
+            data.price = Math.max(...prices.filter(p => p < 500000));
+            data.found = true;
+        }
+    }
+    
+    // Beds
+    const bedsMatch = html.match(/(\d+)\s*(?:bed|beds|bedroom)/i);
+    if (bedsMatch) {
+        data.beds = parseInt(bedsMatch[1]);
+        data.found = true;
+    }
+    
+    // Baths
+    const bathsMatch = html.match(/(\d+(?:\.\d+)?)\s*(?:bath|baths|bathroom)/i);
+    if (bathsMatch) {
+        data.baths = parseFloat(bathsMatch[1]);
+        data.found = true;
+    }
+    
+    // Sqft
+    const sqftMatch = html.match(/([\d,]+)\s*(?:sqft|sq\.ft|square feet)/i);
+    if (sqftMatch) {
+        data.sqft = parseInt(sqftMatch[1].replace(/,/g, ''));
+        data.found = true;
+    }
+    
+    // Address from URL
+    const urlParts = url.split('/');
+    if (urlParts.length >= 4) {
+        data.address = urlParts[3].replace(/-/g, ' ');
+    }
+    
+    return data;
 }
 
 // Create HTTP server
 const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Content-Type', 'application/json');
     
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
@@ -96,33 +99,45 @@ const server = http.createServer(async (req, res) => {
     
     const urlObj = new URL(req.url, 'http://localhost');
     
+    // Health check
+    if (urlObj.pathname === '/health') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ status: 'ok', api: 'ScraperAPI' }));
+        return;
+    }
+    
+    // Scrape endpoint
     if (urlObj.pathname === '/api/scrape' && urlObj.searchParams.get('url')) {
         const targetUrl = urlObj.searchParams.get('url');
         
+        console.log('Scraping:', targetUrl);
+        
         try {
-            console.log('Scraping:', targetUrl);
-            const data = await scrapeProperty(targetUrl);
+            const html = await fetchWithScraperAPI(targetUrl);
+            const data = extractPropertyData(html, targetUrl);
             
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            console.log('Result:', JSON.stringify(data));
+            
+            res.writeHead(200);
             res.end(JSON.stringify(data));
         } catch (error) {
             console.error('Error:', error.message);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: error.message }));
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: error.message, url: targetUrl }));
         }
     }
-    else if (urlObj.pathname === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok' }));
-    }
     else {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Use /api/scrape?url=...' }));
+        res.writeHead(404);
+        res.end(JSON.stringify({ 
+            error: 'Use /api/scrape?url=...',
+            example: '/api/scrape?url=https://www.zillow.com/homedetails/address' 
+        }));
     }
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Property API running on port ${PORT}`);
+    console.log(`Using ScraperAPI: ${SCRAPER_API_KEY.substring(0, 8)}...`);
     console.log(`Usage: curl "http://localhost:${PORT}/api/scrape?url=URL"`);
 });
